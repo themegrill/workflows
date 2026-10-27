@@ -1,0 +1,144 @@
+# Lets any team member request a Copilot code review on a PR by commenting a
+# trigger phrase, even though only tg-autopilot holds a Copilot seat (paying
+# per-seat for 20+ team members was the thing being avoided). Works because
+# GitHub attributes the reviewer-request API call to whichever account's
+# token makes it -- tg-autopilot's, here -- regardless of who commented.
+name: Copilot review on comment
+
+on:
+  workflow_call:
+    inputs:
+      trigger-phrase:
+        description: 'Substring (case-insensitive) that, anywhere in a comment, requests a review.'
+        type: string
+        required: false
+        default: '@tg-autopilot review'
+      min-permission:
+        description: 'Minimum repo permission the commenter must have. One of: write, maintain, admin.'
+        type: string
+        required: false
+        default: 'write'
+    secrets:
+      BOT_TOKEN:
+        required: true
+
+jobs:
+  assign-copilot:
+    if: github.event_name == 'pull_request_target' && github.event.action == 'opened'
+    runs-on: ubuntu-latest
+    steps:
+      # Poll rather than check-once -- Copilot can take over a minute to
+      # actually land (see the request-review job's copy of this step).
+      - name: Request Copilot review
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          copilot_present() {
+            gh api "repos/$REPO/pulls/$PR/requested_reviewers" --jq '.users[].login' | grep -qx 'copilot-pull-request-reviewer\[bot\]' && return 0
+            gh api "repos/$REPO/pulls/$PR/reviews" --jq '.[].user.login' | grep -qx 'copilot-pull-request-reviewer\[bot\]' && return 0
+            return 1
+          }
+
+          gh pr edit "$PR" --repo "$REPO" --add-reviewer @copilot || true
+
+          for check in $(seq 1 18); do
+            if copilot_present; then
+              echo "Copilot review request confirmed after $((check * 10))s."
+              exit 0
+            fi
+            if [ "$check" -eq 6 ]; then
+              echo "Nothing after 60s, re-issuing the request..."
+              gh pr edit "$PR" --repo "$REPO" --add-reviewer @copilot || true
+            fi
+            sleep 10
+          done
+
+          echo "::warning::Copilot review request not confirmed after 3 minutes on $REPO#$PR. This is a known intermittent GitHub platform issue, not a config problem -- it may still complete later."
+
+  request-review:
+    # Only PR comments (issue_comment fires for issues too). Excluding the
+    # bot's own comments is required, not just tidy -- see write-safe-bot-workflow skill.
+    if: |
+      github.event.issue.pull_request != null &&
+      github.event.comment.user.login != 'tg-autopilot' &&
+      contains(github.event.comment.body, inputs.trigger-phrase)
+    runs-on: ubuntu-latest
+    steps:
+      # Each trigger spends tg-autopilot's own Copilot usage, so gate on
+      # min-permission. Computed once here as a plain boolean for later steps.
+      - name: Check commenter's permission
+        id: perm
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          MIN_PERMISSION: ${{ inputs.min-permission }}
+        run: |
+          set -euo pipefail
+          LEVEL=$(gh api "repos/${{ github.repository }}/collaborators/${COMMENTER}/permission" --jq .permission)
+          echo "Commenter permission level: $LEVEL (need at least: $MIN_PERMISSION)"
+
+          rank() { case "$1" in admin) echo 4;; maintain) echo 3;; write) echo 2;; triage) echo 1;; *) echo 0;; esac; }
+
+          if [ "$(rank "$LEVEL")" -ge "$(rank "$MIN_PERMISSION")" ]; then
+            echo "authorized=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: React to acknowledge
+        if: steps.perm.outputs.authorized == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content='eyes' --silent
+
+      # `gh pr edit --add-reviewer @copilot` is confirmed flaky at the
+      # platform level: Copilot can take well over a minute to actually show
+      # up, so a quick check-and-fail reports false failures while it's still
+      # legitimately working. Request once, poll for a while, only re-issue
+      # if nothing shows up.
+      - name: Request Copilot review
+        if: steps.perm.outputs.authorized == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          PR="${{ github.event.issue.number }}"
+          REPO="${{ github.repository }}"
+
+          copilot_present() {
+            gh api "repos/$REPO/pulls/$PR/requested_reviewers" --jq '.users[].login' | grep -qx 'copilot-pull-request-reviewer\[bot\]' && return 0
+            gh api "repos/$REPO/pulls/$PR/reviews" --jq '.[].user.login' | grep -qx 'copilot-pull-request-reviewer\[bot\]' && return 0
+            return 1
+          }
+
+          gh pr edit "$PR" --repo "$REPO" --add-reviewer @copilot || true
+
+          for check in $(seq 1 18); do
+            if copilot_present; then
+              echo "Copilot review request confirmed after $((check * 10))s."
+              exit 0
+            fi
+            # Nothing landed after 60s -- the first request may have been a
+            # genuine no-op, so ask again once before continuing to wait.
+            if [ "$check" -eq 6 ]; then
+              echo "Nothing after 60s, re-issuing the request..."
+              gh pr edit "$PR" --repo "$REPO" --add-reviewer @copilot || true
+            fi
+            sleep 10
+          done
+
+          echo "::warning::Copilot review request not confirmed after 3 minutes on $REPO#$PR. This is a known intermittent GitHub platform issue, not a config problem -- it may still complete later."
+
+      - name: Reply if not authorized
+        if: steps.perm.outputs.authorized == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
+            -f body="@${{ github.event.comment.user.login }} only accounts with write access (or higher) can request a Copilot review this way."

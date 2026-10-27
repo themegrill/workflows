@@ -1,0 +1,519 @@
+# Reusable workflow: build a testable plugin/theme ZIP for a PR, upload it to
+# object storage, and keep ONE PR comment updated with a direct download link.
+#
+# Lives in themegrill/workflows. Consuming repos call it with a short caller
+# workflow -- see pr-build-zip.caller.yml for a template.
+name: PR Build ZIP
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: 'Node version to build with.'
+        type: string
+        required: false
+        default: '20.x'
+      php-version:
+        description: 'PHP version to build with.'
+        type: string
+        required: false
+        default: '7.4'
+      package-manager:
+        description: 'yarn, npm, or pnpm. Selects the install command and cache paths.'
+        type: string
+        required: false
+        default: 'yarn'
+      pnpm-version:
+        description: |
+          pnpm version to install. Leave empty (default) to auto-detect from
+          the repo's package.json "packageManager" field via Corepack -- set
+          this explicitly only for repos that don't pin one there.
+        type: string
+        required: false
+        default: ''
+      install-command:
+        description: 'Overrides the default install command entirely.'
+        type: string
+        required: false
+        default: ''
+      composer-install:
+        description: 'Run composer install before building.'
+        type: boolean
+        required: false
+        default: true
+      checkout-submodules:
+        description: 'Check out git submodules too (needed if the build depends on one, e.g. a bundled SDK).'
+        type: boolean
+        required: false
+        default: false
+      build-command:
+        description: |
+          Command(s) that produce the distributable ZIP. This should call the
+          repo's OWN release tooling (gulp release, yarn dist, ...) so packaging
+          rules such as .distignore stay owned by the repo, not by the bot.
+        type: string
+        required: true
+      zip-glob:
+        description: 'Where to find the produced ZIP. First match wins.'
+        type: string
+        required: false
+        default: 'release/*.zip'
+      label:
+        description: |
+          Short label for the primary ZIP in the PR comment (e.g. "Free").
+          Leave empty (default) for a single-artifact repo -- the comment
+          then shows just the filename, unchanged from before this input
+          existed.
+        type: string
+        required: false
+        default: ''
+      extra-build-command:
+        description: |
+          Optional second build step, for the (rare) case where the second
+          artifact needs its own command. Most dual-artifact repos don't need
+          this: if build-command already produces both zips in one pass (e.g.
+          a single dist script), leave this empty and set only extra-zip-glob
+          below to pick up the second one. Runs after build-command, in the
+          same job/checkout. Leave both extra-* inputs empty (default) for a
+          single-artifact repo -- every existing caller is unaffected.
+        type: string
+        required: false
+        default: ''
+      extra-zip-glob:
+        description: |
+          Where to find the second artifact. Setting this (regardless of
+          extra-build-command) is what turns on the two-zip behavior: the
+          second zip is located, uploaded, and listed in the same PR comment
+          as the first.
+        type: string
+        required: false
+        default: ''
+      extra-label:
+        description: 'Short label for the second ZIP in the PR comment (e.g. "Pro").'
+        type: string
+        required: false
+        default: ''
+      artifact-prefix:
+        description: 'Storage key prefix. Defaults to the repository name.'
+        type: string
+        required: false
+        default: ''
+      artifacts-bucket:
+        description: |
+          Bucket name to upload to. Not sensitive -- keep it a plain input,
+          not a secret (Actions masks any string matching a registered
+          secret's value everywhere it appears, which would break the
+          public-base-url and the PR comment's download link).
+        type: string
+        required: true
+      public-base-url:
+        description: |
+          Public base URL that fronts the bucket, no trailing slash.
+          e.g. https://artifacts.themegrill.com  (S3 website/CloudFront, R2
+          custom domain, or the r2.dev subdomain).
+        type: string
+        required: true
+      s3-endpoint:
+        description: 'Custom S3 endpoint. Required for Cloudflare R2, leave empty for AWS S3.'
+        type: string
+        required: false
+        default: ''
+      s3-region:
+        description: 'Bucket region. Use "auto" for R2.'
+        type: string
+        required: false
+        default: 'us-east-1'
+      retention-days:
+        description: 'Stated link lifetime, for the comment text. Must match the bucket lifecycle rule.'
+        type: number
+        required: false
+        default: 30
+      preview-link:
+        description: |
+          "Try this PR in a live test site" link in the PR comment: a WordPress
+          Playground site (runs in the browser, no install) with this build
+          installed and activated. Previews the primary ZIP only.
+            auto  (default) -- only repos listed in config/preview-link-repos.json
+                    in themegrill/workflows get it. No change needed in the caller.
+            true  -- force it on for this repo, using the preview-* inputs below.
+            false -- never.
+          Needs the bucket's CORS to allow GET/HEAD from https://playground.wordpress.net.
+        type: string
+        required: false
+        default: 'auto'
+      preview-type:
+        description: 'Overrides the enrolled entry: "plugin" or "theme". Empty = entry, then plugin.'
+        type: string
+        required: false
+        default: ''
+      preview-landing-page:
+        description: 'Overrides the enrolled entry: site path to open, e.g. /wp-admin/admin.php?page=my-plugin. Empty = entry, then /wp-admin/plugins.php.'
+        type: string
+        required: false
+        default: ''
+      preview-php:
+        description: 'Overrides the enrolled entry: PHP version 7.4 to 8.4. Empty = entry, then 8.2.'
+        type: string
+        required: false
+        default: ''
+      preview-wp:
+        description: 'Overrides the enrolled entry: "latest" or a version like 6.8. Empty = entry, then latest.'
+        type: string
+        required: false
+        default: ''
+      preview-tools-ref:
+        description: 'Ref of themegrill/workflows to take the preview script and enrolment list from. Leave as is; set to a branch only to test a change.'
+        type: string
+        required: false
+        default: 'master'
+      timezone:
+        description: 'Timezone for the "last updated" stamp in the comment.'
+        type: string
+        required: false
+        default: 'Asia/Kathmandu'
+    secrets:
+      BOT_TOKEN:
+        description: 'PAT of the tg-autopilot machine user. Makes the comment come from the bot identity.'
+        required: true
+      ARTIFACTS_KEY:
+        required: true
+      ARTIFACTS_SECRET:
+        required: true
+
+concurrency:
+  # Collapse rapid pushes to the same PR so builds do not stack up.
+  group: pr-build-zip-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Check trigger conditions
+    # Skip drafts, but always run a manual dispatch. Skip fork PRs too: forks
+    # never get repo secrets, so BOT_TOKEN/ARTIFACTS_* are unset and the job
+    # would just fail loudly on the upload/comment steps.
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+       github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name)
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.decide.outputs.proceed }}
+    steps:
+      # Always build on open/reopen/ready-for-review (and non-PR triggers,
+      # e.g. workflow_dispatch) -- only a follow-up push needs the marker.
+      # Checked here, not as a job-level `if:`, since it needs the actual
+      # commit message, which isn't in the pull_request event payload.
+      - name: Decide whether to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ "${{ github.event_name != 'pull_request' || github.event.action != 'synchronize' }}" = "true" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          MESSAGE=$(gh api "repos/$REPO/commits/$SHA" --jq '.commit.message')
+          if echo "$MESSAGE" | grep -qi '#build-zip'; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping build -- commit message has no #build-zip. Push again with it in the message (or comment/reopen) to force a rebuild."
+          fi
+
+  build:
+    name: Build ZIP and comment
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Explicit ref: without it, a pull_request event checks out GitHub's
+      # synthetic merge commit, not the PR's own head -- and we label the zip
+      # by head.sha below, so build exactly that commit.
+      - name: Check out PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          submodules: ${{ inputs.checkout-submodules }}
+
+      - name: Set up PHP ${{ inputs.php-version }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php-version }}
+          tools: composer
+
+      # pnpm must be on PATH before setup-node's cache step runs (it shells
+      # out to resolve the cache directory), even when install-command
+      # overrides the install step below.
+      - name: Set up pnpm
+        if: inputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - name: Set up Node ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      # Cache keyed on whichever lockfiles exist, so this works for yarn, npm,
+      # and pnpm without the caller having to say which.
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            ~/.cache/yarn
+            ~/.npm
+            ~/.local/share/pnpm/store
+            ~/.cache/composer
+          key: ${{ runner.os }}-deps-${{ hashFiles('**/yarn.lock', '**/package-lock.json', '**/pnpm-lock.yaml', '**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-deps-
+
+      # --no-dev: a distributable ZIP should never bundle dev/test tooling.
+      # --ignore-platform-reqs: composer validates the WHOLE lockfile's PHP
+      # version requirement up front, including require-dev packages, even
+      # though --no-dev will exclude them. When dev-only deps declare an
+      # older PHP floor than production deps need, no single php-version
+      # input can satisfy both -- this flag skips that validation. Safe here
+      # because --no-dev already means those packages are never installed.
+      - name: Install Composer dependencies
+        if: inputs.composer-install
+        run: composer install --prefer-dist --no-interaction --no-progress --no-dev --ignore-platform-reqs
+
+      - name: Install JS dependencies
+        # install-command comes in via env, not direct ${{ }} interpolation:
+        # ${{ }} is substituted textually with no shell-escaping, so a value
+        # containing a `"` can break the `if [ -n "..." ]` test below. An env
+        # var's value is real process data and can't corrupt the script text.
+        env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+        run: |
+          if [ -n "$INSTALL_COMMAND" ]; then
+            eval "$INSTALL_COMMAND"
+          elif [ "${{ inputs.package-manager }}" = "npm" ]; then
+            npm ci
+          elif [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm install --frozen-lockfile
+          else
+            yarn install --frozen-lockfile
+          fi
+
+      # Some release tasks shell out to `wp i18n make-pot`, which only parses
+      # PHP source (no DB/WordPress install needed) -- the standalone .phar is
+      # enough. Installed unconditionally since it's cheap and harmless for
+      # build-commands that don't call `wp` at all.
+      - name: Install WP-CLI
+        run: |
+          curl -sO https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+          chmod +x wp-cli.phar
+          sudo mv wp-cli.phar /usr/local/bin/wp
+
+      - name: Build distributable
+        run: ${{ inputs.build-command }}
+
+      - name: Locate the ZIP
+        id: zip
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          ZIP=$(ls -1 ${{ inputs.zip-glob }} 2>/dev/null | head -n 1 || true)
+          if [ -z "$ZIP" ]; then
+            echo "::error::No ZIP matched '${{ inputs.zip-glob }}'. Check build-command and zip-glob."
+            exit 1
+          fi
+          echo "path=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$ZIP")" >> "$GITHUB_OUTPUT"
+          echo "size=$(du -h "$ZIP" | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      # Second artifact from the same tree/checkout (e.g. a Pro build
+      # alongside the Free one above) -- only when the caller opts in.
+      - name: Build extra distributable
+        if: inputs.extra-build-command != ''
+        run: ${{ inputs.extra-build-command }}
+
+      - name: Locate the extra ZIP
+        id: zip2
+        if: inputs.extra-zip-glob != ''
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          ZIP=$(ls -1 ${{ inputs.extra-zip-glob }} 2>/dev/null | head -n 1 || true)
+          if [ -z "$ZIP" ]; then
+            echo "::error::No ZIP matched '${{ inputs.extra-zip-glob }}'. Check extra-build-command and extra-zip-glob."
+            exit 1
+          fi
+          echo "path=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$ZIP")" >> "$GITHUB_OUTPUT"
+          echo "size=$(du -h "$ZIP" | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      # Keyed by branch, not SHA: each push to the same PR overwrites the same
+      # object instead of piling up one per push.
+      - name: Compute storage key
+        id: key
+        env:
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          SHA8=$(echo "${{ github.event.pull_request.head.sha || github.sha }}" | cut -c1-8)
+          BRANCH=$(echo "$HEAD_REF" | sed 's#[^a-zA-Z0-9._-]#-#g')
+          PREFIX="${{ inputs.artifact-prefix }}"
+          [ -n "$PREFIX" ] || PREFIX="${{ github.event.repository.name }}"
+          echo "sha8=$SHA8" >> "$GITHUB_OUTPUT"
+          echo "dir=${PREFIX}-${BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload ZIP to object storage
+        id: upload
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.ARTIFACTS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.ARTIFACTS_SECRET }}
+          AWS_DEFAULT_REGION: ${{ inputs.s3-region }}
+        run: |
+          set -euo pipefail
+          ENDPOINT=""
+          if [ -n "${{ inputs.s3-endpoint }}" ]; then
+            ENDPOINT="--endpoint-url ${{ inputs.s3-endpoint }}"
+          fi
+          KEY="${{ steps.key.outputs.dir }}/${{ steps.zip.outputs.name }}"
+          # No --acl: modern S3 enforces bucket-owner ownership (ACLs
+          # disabled) and R2 has none at all. Public read comes from the
+          # bucket policy / R2 public access set up once separately.
+          aws s3 cp "${{ steps.zip.outputs.path }}" "s3://${{ inputs.artifacts-bucket }}/${KEY}" \
+            $ENDPOINT --no-progress --content-type application/zip
+          echo "url=${{ inputs.public-base-url }}/${KEY}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload extra ZIP to object storage
+        id: upload2
+        if: inputs.extra-zip-glob != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.ARTIFACTS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.ARTIFACTS_SECRET }}
+          AWS_DEFAULT_REGION: ${{ inputs.s3-region }}
+        run: |
+          set -euo pipefail
+          ENDPOINT=""
+          if [ -n "${{ inputs.s3-endpoint }}" ]; then
+            ENDPOINT="--endpoint-url ${{ inputs.s3-endpoint }}"
+          fi
+          KEY="${{ steps.key.outputs.dir }}/${{ steps.zip2.outputs.name }}"
+          aws s3 cp "${{ steps.zip2.outputs.path }}" "s3://${{ inputs.artifacts-bucket }}/${KEY}" \
+            $ENDPOINT --no-progress --content-type application/zip
+          echo "url=${{ inputs.public-base-url }}/${KEY}" >> "$GITHUB_OUTPUT"
+
+      # Optional extra. Must never break the build comment: both steps are
+      # continue-on-error, and the comment simply omits the link if there is none.
+      - name: Check out preview tooling
+        if: inputs.preview-link != 'false'
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: themegrill/workflows
+          ref: ${{ inputs.preview-tools-ref }}
+          path: .preview-tools
+          sparse-checkout: |
+            scripts/preview-link.mjs
+            config/preview-link-repos.json
+          sparse-checkout-cone-mode: false
+
+      - name: Build preview link
+        id: preview
+        if: inputs.preview-link != 'false'
+        continue-on-error: true
+        env:
+          PREVIEW_LINK: ${{ inputs.preview-link }}
+          PREVIEW_REPO: ${{ github.repository }}
+          PREVIEW_CONFIG_PATH: .preview-tools/config/preview-link-repos.json
+          PREVIEW_ZIP_URL: ${{ steps.upload.outputs.url }}
+          PREVIEW_TYPE: ${{ inputs.preview-type }}
+          PREVIEW_LANDING_PAGE: ${{ inputs.preview-landing-page }}
+          PREVIEW_PHP: ${{ inputs.preview-php }}
+          PREVIEW_WP: ${{ inputs.preview-wp }}
+        run: node .preview-tools/scripts/preview-link.mjs
+
+      - name: Stamp build time
+        id: stamp
+        run: echo "at=$(TZ='${{ inputs.timezone }}' date '+%b %-d, %Y %-I:%M %p %Z')" >> "$GITHUB_OUTPUT"
+
+      # Match by author + marker, never comment.user.type == 'Bot' -- a
+      # machine user account is type "User", so that check never matches.
+      - name: Find previous bot comment
+        uses: peter-evans/find-comment@v3
+        id: find
+        if: github.event_name == 'pull_request'
+        with:
+          token: ${{ secrets.BOT_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: tg-autopilot
+          body-includes: '<!-- tg-autopilot: pr-build-zip -->'
+
+      # Built as a file (not an inline `body:`) so the one-or-two-artifact
+      # cases share one template instead of a brittle nested-ternary
+      # expression in YAML.
+      - name: Compose comment body
+        id: compose
+        env:
+          LABEL: ${{ inputs.label }}
+          EXTRA_LABEL: ${{ inputs.extra-label }}
+          EXTRA_NAME: ${{ steps.zip2.outputs.name }}
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+        run: |
+          set -euo pipefail
+          {
+            echo "<!-- tg-autopilot: pr-build-zip -->"
+            echo "Build for \`${{ steps.key.outputs.sha8 }}\` is ready :bellhop_bell:"
+            echo ""
+            if [ -n "$LABEL" ]; then
+              echo "**${LABEL}: [:arrow_down: Download ${{ steps.zip.outputs.name }}](${{ steps.upload.outputs.url }})** (${{ steps.zip.outputs.size }})"
+            else
+              echo "**[:arrow_down: Download ${{ steps.zip.outputs.name }}](${{ steps.upload.outputs.url }})** (${{ steps.zip.outputs.size }})"
+            fi
+            if [ -n "$EXTRA_NAME" ]; then
+              if [ -n "$EXTRA_LABEL" ]; then
+                echo "**${EXTRA_LABEL}: [:arrow_down: Download ${{ steps.zip2.outputs.name }}](${{ steps.upload2.outputs.url }})** (${{ steps.zip2.outputs.size }})"
+              else
+                echo "**[:arrow_down: Download ${{ steps.zip2.outputs.name }}](${{ steps.upload2.outputs.url }})** (${{ steps.zip2.outputs.size }})"
+              fi
+            fi
+            if [ -n "$PREVIEW_URL" ]; then
+              echo ""
+              echo "**[:rocket: Try this PR in a live test site]($PREVIEW_URL)** (a fresh WordPress opens in your browser with this build installed and you logged in as admin; it resets when you close the tab)"
+            fi
+            echo ""
+            echo "Installs directly via **Plugins → Add New → Upload Plugin**."
+            echo "Link expires in ${{ inputs.retention-days }} days · updated ${{ steps.stamp.outputs.at }}"
+            echo ""
+            echo "<sub>A later push only rebuilds this if its commit message includes \`#build-zip\`.</sub>"
+          } > comment-body.md
+
+      - name: Post or update the PR comment
+        uses: peter-evans/create-or-update-comment@v4
+        if: github.event_name == 'pull_request'
+        with:
+          token: ${{ secrets.BOT_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-id: ${{ steps.find.outputs.comment-id }}
+          edit-mode: replace
+          body-path: comment-body.md
+
+      - name: Run summary
+        env:
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+        run: |
+          {
+            echo "### Build ZIP"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${{ steps.key.outputs.sha8 }}\` |"
+            echo "| ZIP | ${{ steps.zip.outputs.name }} (${{ steps.zip.outputs.size }}) |"
+            echo "| Download | ${{ steps.upload.outputs.url }} |"
+            if [ -n "${{ steps.zip2.outputs.name }}" ]; then
+              echo "| Extra ZIP | ${{ steps.zip2.outputs.name }} (${{ steps.zip2.outputs.size }}) |"
+              echo "| Extra Download | ${{ steps.upload2.outputs.url }} |"
+            fi
+            if [ -n "$PREVIEW_URL" ]; then
+              echo "| Preview | [Open live test site]($PREVIEW_URL) |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
