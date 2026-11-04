@@ -89,6 +89,11 @@ jobs:
           fi
 
       # ---- PHPCS -------------------------------------------------------
+      # Skipping silently would read as "PHP is clean". Say so instead.
+      - name: Note when PHPCS is skipped
+        if: inputs.run-phpcs && steps.changed.outputs.php_count != '0' && steps.changed.outputs.has_phpcs_config != 'true'
+        run: echo "::notice title=PHPCS skipped::PHP files changed but this repo has no phpcs.xml or phpcs.xml.dist, so nothing was linted. Add a ruleset to enable PHPCS."
+
       - name: Set up PHP
         if: inputs.run-phpcs && steps.changed.outputs.php_count != '0' && steps.changed.outputs.has_phpcs_config == 'true'
         uses: shivammathur/setup-php@v2
