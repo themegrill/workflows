@@ -24,7 +24,9 @@ permissions:
 jobs:
   security:
     uses: themegrill/workflows/.github/workflows/security-scan.yml@master
-    secrets: inherit
+    # Pass ONLY the key this workflow needs. `secrets: inherit` would hand it every secret in the repo.
+    secrets:
+      CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
     # with:
     #   model: claude-sonnet-5-5
     #   max-diff-tokens: 20000

@@ -2,8 +2,8 @@
 # result as a PR review. Replaces the per-repo security-review.yml copies.
 #
 # Consuming repos call it with a short caller -- see security-scan.caller.yml. The caller MUST grant
-# `pull-requests: write` (a reusable workflow cannot exceed its caller's permissions) and pass the
-# CLAUDE_API_KEY secret (`secrets: inherit`).
+# `pull-requests: write` (a reusable workflow cannot exceed its caller's permissions) and pass ONLY the
+# CLAUDE_API_KEY secret, explicitly -- not `secrets: inherit`, which would expose every repo secret.
 #
 # A scan that could not complete (API error, unparseable reply) FAILS the check and says so. It never
 # reports "no issues found" -- a broken scan must not look like a clean one.
