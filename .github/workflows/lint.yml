@@ -106,7 +106,13 @@ jobs:
 
       - name: Install Composer dependencies
         if: inputs.run-phpcs && steps.changed.outputs.php_count != '0' && steps.changed.outputs.has_phpcs_config == 'true'
-        run: composer install --no-interaction --no-progress --prefer-dist
+        run: |
+          composer install --no-interaction --no-progress --prefer-dist || {
+            # A dev-only dependency (phpunit, docblock tooling) can need a newer PHP than
+            # this job runs, which aborts the whole install even though PHPCS never loads it.
+            echo "::notice title=composer install retried::Failed on this PHP version; retrying with --ignore-platform-reqs."
+            composer install --no-interaction --no-progress --prefer-dist --ignore-platform-reqs
+          }
 
       - name: PHPCS (changed files)
         if: inputs.run-phpcs && steps.changed.outputs.php_count != '0' && steps.changed.outputs.has_phpcs_config == 'true'
@@ -138,8 +144,15 @@ jobs:
           # package manager from the lockfile the repo actually committed.
           if   [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile
           elif [ -f yarn.lock ];      then corepack enable && yarn install --frozen-lockfile
-          elif [ -f package-lock.json ]; then npm ci --no-audit --no-fund
-          else                             npm install --no-audit --no-fund  # no lockfile committed (e.g. flash)
+          elif [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund || {
+              # Peer-dependency conflicts (ERESOLVE) are common in older WP tooling.
+              echo "::notice title=npm install retried::npm ci failed; retrying with --legacy-peer-deps."
+              npm ci --no-audit --no-fund --legacy-peer-deps || npm install --no-audit --no-fund --legacy-peer-deps
+            }
+          else
+            # No lockfile committed (e.g. flash).
+            npm install --no-audit --no-fund || npm install --no-audit --no-fund --legacy-peer-deps
           fi
 
       - name: ESLint (changed files)
