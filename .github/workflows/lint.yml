@@ -148,8 +148,8 @@ jobs:
           FAIL_ON_VIOLATIONS: ${{ inputs.fail-on-violations }}
         run: |
           echo "Linting $(wc -l < changed-js.txt | tr -d ' ') JS/TS file(s)"
-          # --no-error-on-unmatched-pattern: a changed file the config ignores is fine.
-          xargs -a changed-js.txt npx --no-install eslint --no-error-on-unmatched-pattern || status=$?
+          # No version-specific flags: some repos pin an old ESLint that rejects them.
+          xargs -a changed-js.txt npx --no-install eslint || status=$?
           if [ "${status:-0}" -ne 0 ] && [ "$FAIL_ON_VIOLATIONS" != "true" ]; then
             echo "::notice::ESLint found errors, but fail-on-violations is false."
             exit 0
