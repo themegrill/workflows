@@ -84,7 +84,9 @@ jobs:
           if [ -f phpcs.xml ] || [ -f phpcs.xml.dist ] || [ -f .phpcs.xml ] || [ -f .phpcs.xml.dist ]; then
             echo "has_phpcs_config=true" >> "$GITHUB_OUTPUT"
           fi
-          if ls .eslintrc* eslint.config.* >/dev/null 2>&1 || grep -q '"eslintConfig"' package.json 2>/dev/null; then
+          # Not `ls a* b*`: ls exits non-zero if EITHER glob matches nothing,
+          # which hid flash's .eslintrc.json (no eslint.config.* alongside it).
+          if compgen -G ".eslintrc*" >/dev/null || compgen -G "eslint.config.*" >/dev/null || grep -q '"eslintConfig"' package.json 2>/dev/null; then
             echo "has_eslint_config=true" >> "$GITHUB_OUTPUT"
           fi
 
