@@ -138,7 +138,8 @@ jobs:
           # package manager from the lockfile the repo actually committed.
           if   [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile
           elif [ -f yarn.lock ];      then corepack enable && yarn install --frozen-lockfile
-          else                             npm ci --no-audit --no-fund
+          elif [ -f package-lock.json ]; then npm ci --no-audit --no-fund
+          else                             npm install --no-audit --no-fund  # no lockfile committed (e.g. flash)
           fi
 
       - name: ESLint (changed files)
