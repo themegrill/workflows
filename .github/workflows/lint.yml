@@ -124,14 +124,15 @@ jobs:
           exit "${status:-0}"
 
       # ---- ESLint ------------------------------------------------------
+      # !cancelled(): still run when PHPCS failed, so one tool's failure never hides the other's.
       - name: Set up Node
-        if: inputs.run-eslint && steps.changed.outputs.js_count != '0' && steps.changed.outputs.has_eslint_config == 'true'
+        if: ${{ !cancelled() && inputs.run-eslint && steps.changed.outputs.js_count != '0' && steps.changed.outputs.has_eslint_config == 'true' }}
         uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
 
       - name: Install JS dependencies
-        if: inputs.run-eslint && steps.changed.outputs.js_count != '0' && steps.changed.outputs.has_eslint_config == 'true'
+        if: ${{ !cancelled() && inputs.run-eslint && steps.changed.outputs.js_count != '0' && steps.changed.outputs.has_eslint_config == 'true' }}
         run: |
           # ESLint needs the repo's own plugins/configs installed. Pick the
           # package manager from the lockfile the repo actually committed.
@@ -141,7 +142,7 @@ jobs:
           fi
 
       - name: ESLint (changed files)
-        if: inputs.run-eslint && steps.changed.outputs.js_count != '0' && steps.changed.outputs.has_eslint_config == 'true'
+        if: ${{ !cancelled() && inputs.run-eslint && steps.changed.outputs.js_count != '0' && steps.changed.outputs.has_eslint_config == 'true' }}
         env:
           FAIL_ON_VIOLATIONS: ${{ inputs.fail-on-violations }}
         run: |
