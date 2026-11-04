@@ -1,0 +1,22 @@
+# TEMPLATE -- copy into a consuming repo as .github/workflows/lint.yml.
+# Lints only the files the PR changed, using the repo's own phpcs.xml / ESLint config.
+name: Lint
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - '**.php'
+      - '**.js'
+      - '**.jsx'
+      - '**.ts'
+      - '**.tsx'
+
+jobs:
+  lint:
+    uses: themegrill/workflows/.github/workflows/lint.yml@master
+    with:
+      php-version: '7.4'
+      # run-eslint: false        # PHP-only repo, skip ESLint
+      # run-phpcs: false         # JS-only repo, skip PHPCS
+      # fail-on-violations: false  # annotate only, never fail the check
