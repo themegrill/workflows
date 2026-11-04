@@ -1,0 +1,32 @@
+# TEMPLATE -- copy into a consuming repo as .github/workflows/security-scan.yml.
+# Claude reviews the PHP/JS lines the PR changes for WordPress security issues and posts a PR review.
+# Needs the CLAUDE_API_KEY repository secret. Add the label `ignore-claude-scan` (or `sync`) to skip a PR.
+name: Security Check
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: [main, master]
+    paths:
+      - '**.php'
+      - '**.js'
+      - '**.ts'
+      - '**.tsx'
+      - '!**.min.js'
+      - '!**/vendor/**'
+      - '!**/node_modules/**'
+
+# The shared workflow posts reviews, so the caller must grant this.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  security:
+    uses: themegrill/workflows/.github/workflows/security-scan.yml@master
+    secrets: inherit
+    # with:
+    #   model: claude-sonnet-5-5
+    #   max-diff-tokens: 20000
+    #   on-oversize: skip        # warn and skip huge PRs instead of failing the check
+    #   fail-on-issues: false    # review only; never fail the check
