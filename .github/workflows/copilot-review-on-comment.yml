@@ -37,13 +37,23 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Use the REST endpoint, NOT `gh pr edit --add-reviewer @copilot`: once a
+          # human reviewer has replaced Copilot on a PR (Copilot's pending request
+          # removed, its run ending in copilot_work_finished_failure), the gh/GraphQL
+          # path exits 0 but GitHub silently drops the request. Reproduced on
+          # themegrill-child (gh: ignored for 2 min; REST: landed in 2s).
+          request_copilot() {
+            gh api -X POST "repos/$REPO/pulls/$PR/requested_reviewers" \
+              -f 'reviewers[]=copilot-pull-request-reviewer[bot]' --silent || true
+          }
+
           copilot_present() {
             gh api "repos/$REPO/pulls/$PR/requested_reviewers" --jq '.users[].login' | grep -qx 'copilot-pull-request-reviewer\[bot\]' && return 0
             gh api "repos/$REPO/pulls/$PR/reviews" --jq '.[].user.login' | grep -qx 'copilot-pull-request-reviewer\[bot\]' && return 0
             return 1
           }
 
-          gh pr edit "$PR" --repo "$REPO" --add-reviewer @copilot || true
+          request_copilot
 
           for check in $(seq 1 18); do
             if copilot_present; then
@@ -52,7 +62,7 @@ jobs:
             fi
             if [ "$check" -eq 6 ]; then
               echo "Nothing after 60s, re-issuing the request..."
-              gh pr edit "$PR" --repo "$REPO" --add-reviewer @copilot || true
+              request_copilot
             fi
             sleep 10
           done
@@ -111,13 +121,23 @@ jobs:
           PR="${{ github.event.issue.number }}"
           REPO="${{ github.repository }}"
 
+          # Use the REST endpoint, NOT `gh pr edit --add-reviewer @copilot`: once a
+          # human reviewer has replaced Copilot on a PR (Copilot's pending request
+          # removed, its run ending in copilot_work_finished_failure), the gh/GraphQL
+          # path exits 0 but GitHub silently drops the request. Reproduced on
+          # themegrill-child (gh: ignored for 2 min; REST: landed in 2s).
+          request_copilot() {
+            gh api -X POST "repos/$REPO/pulls/$PR/requested_reviewers" \
+              -f 'reviewers[]=copilot-pull-request-reviewer[bot]' --silent || true
+          }
+
           copilot_present() {
             gh api "repos/$REPO/pulls/$PR/requested_reviewers" --jq '.users[].login' | grep -qx 'copilot-pull-request-reviewer\[bot\]' && return 0
             gh api "repos/$REPO/pulls/$PR/reviews" --jq '.[].user.login' | grep -qx 'copilot-pull-request-reviewer\[bot\]' && return 0
             return 1
           }
 
-          gh pr edit "$PR" --repo "$REPO" --add-reviewer @copilot || true
+          request_copilot
 
           for check in $(seq 1 18); do
             if copilot_present; then
@@ -128,7 +148,7 @@ jobs:
             # genuine no-op, so ask again once before continuing to wait.
             if [ "$check" -eq 6 ]; then
               echo "Nothing after 60s, re-issuing the request..."
-              gh pr edit "$PR" --repo "$REPO" --add-reviewer @copilot || true
+              request_copilot
             fi
             sleep 10
           done
